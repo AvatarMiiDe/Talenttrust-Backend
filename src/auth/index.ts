@@ -1,9 +1,9 @@
 export { Role, Resource, Action, ACCESS_CONTROL_MATRIX, VALID_ROLES } from './roles';
 export {
   isAllowed,
-  setAuthorizationLogger,
-  resetAuthorizationLogger,
-  AuthorizationLogger,
+  evaluateAuthorization,
+  AuthorizationDecision,
+  AuthorizationReason,
 } from './authorize';
 export {
   TokenPayload,
