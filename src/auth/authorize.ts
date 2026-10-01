@@ -164,24 +164,40 @@ export function isAllowed(role: Role, resource: Resource, action: Action): boole
       return false;
     }
 
-    const permissions = ACCESS_CONTROL_MATRIX[role];
-    if (!permissions) {
+    if (!VALID_ROLE_SET.has(role)) {
       // Unknown role — deny by default. We do not log the raw role
       // value to avoid leaking potentially sensitive identifiers.
       activeLogger.warn('authorization.denied.unknown_role');
       return false;
     }
 
-    const actions = permissions[resource];
+    if (!VALID_RESOURCE_SET.has(resource)) {
+      // Unknown resource — deny by default.
+      activeLogger.warn('authorization.denied.unknown_resource');
+      return false;
+    }
+
+    if (!VALID_ACTION_SET.has(action)) {
+      // Unknown action — deny by default.
+      activeLogger.warn('authorization.denied.unknown_action');
+      return false;
+    }
+
+    const permissions = FROZEN_MATRIX[role as Role];
+    if (!permissions) {
+      activeLogger.warn('authorization.denied.unknown_role');
+      return false;
+    }
+
+    const actions = permissions[resource as Resource];
     if (!actions) {
-      // Unknown resource for a valid role — deny by default.
       activeLogger.warn('authorization.denied.unknown_resource');
       return false;
     }
 
     // `Array.prototype.includes` is stable and deterministic for the
     // immutable matrix arrays. Unknown actions simply yield `false`.
-    return Actions.includes(action);
+    return actions.includes(action as Action);
   } catch (error) {
     // Fail closed: any unexpected error results in a deny. We log a
     // sanitized message only — never the raw inputs — so failures are
