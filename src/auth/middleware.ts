@@ -1,7 +1,7 @@
 import { Response, NextFunction } from 'express';
 import { Resource, Action } from './roles';
 import { AuthenticatedRequest } from './authenticate';
-import { isAllowed } from './authorize';
+import { evaluateAuthorization } from './authorize';
 import { getContext, requestContextStorage } from '../context';
 
 /**
@@ -38,17 +38,10 @@ export function requirePermission(resource: Resource, action: Action) {
     const current = getContext() ?? {};
     const enriched = { ...current, actorId: user.userId };
     requestContextStorage.run(enriched, () => {
-      let allowed: boolean;
-      try {
-        allowed = isAllowed(user.role, resource, action);
-      } catch {
-        // Fail closed: any error during authorization must not grant access.
-        // We do not expose the underlying error to the client.
-        res.status(500).json({ error: 'Authorization failed' });
-        return;
-      }
-
-      if (!allowed) {
+      // Use the decision API so unexpected-input denials (unregistered
+      // role/resource, unrecognized action) are logged with a reason while
+      // the response contract stays byte-for-byte identical.
+      if (!evaluateAuthorization(user.role, resource, action).allowed) {
         res.status(403).json({ error: 'Forbidden: insufficient permissions' });
         return;
       }

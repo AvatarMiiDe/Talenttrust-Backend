@@ -6,7 +6,39 @@
  * is permitted to perform a specific action on a resource, based on the
  * access control matrix defined in `roles.ts`.
  *
- * Security notes:
+ * ## Public compatibility contract
+ *
+ * `isAllowed(role, resource, action)` is the stable, public entry point of
+ * this module. The following guarantees are part of its contract and MUST be
+ * preserved across releases (locked in by the tests in
+ * `../__tests__/authorize.test.ts`):
+ *
+ *   1. **Total** — for every possible input, including unknown roles,
+ *      unknown resources/actions, `null`/`undefined`, non-string values and
+ *      inherited object keys such as `__proto__` or `constructor`, the
+ *      function returns a `boolean` and never throws.
+ *   2. **Deny-by-default** — a triplet that is not explicitly granted in
+ *      `ACCESS_CONTROL_MATRIX` resolves to `false`. `true` is returned only
+ *      for an own, exact grant in the matrix.
+ *   3. **Pure / deterministic** — no module state is read or written and the
+ *      result depends solely on the arguments. Repeated, retried and
+ *      concurrent calls with the same arguments always return the same value.
+ *   4. **Safe lookups** — the matrix is only ever read through own-property
+ *      checks, so prototype members (`__proto__`, `constructor`, `toString`,
+ *      …) can never be mistaken for a registered role, resource or grant.
+ *
+ * ## Observability
+ *
+ * `evaluateAuthorization` exposes the same decision together with a
+ * machine-readable `reason` code and emits a structured `warn` record when a
+ * denial is caused by *unexpected* input (an unregistered role/resource, an
+ * unrecognized action, or malformed input). Ordinary permission denials are
+ * not logged, so audit noise stays low while configuration drift is
+ * diagnosable. Log records contain only the (non-sensitive) role/resource/
+ * action descriptors — never tokens, identities or record contents.
+ *
+ * ## Security notes
+ *
  *   - Unknown roles are denied by default (deny-by-default).
  *   - Unknown resources or actions are denied by default.
  *   - No runtime mutation of the matrix is permitted from this module.
@@ -24,127 +56,161 @@
  *     there is no shared mutable state involved.
  */
 
-import {
-  Role,
-  Resource,
-  Action,
-  ACCESS_CONTROL_MATRIX,
-  VALID_ROLES,
-  VALID_RESOURCES,
-  VALID_ACTIONS,
-} from './roles';
+import { Role, Resource, Action, ACCESS_CONTROL_MATRIX } from './roles';
+import { createLogger } from '../logger';
+
+const log = createLogger({ module: 'authorize' });
 
 /**
- * The set of identifiers that are considered valid for each dimension.
+ * Machine-readable reason attached to every authorization decision.
  *
- * These are derived from the canonical definitions in `roles.ts` so the
- * validation boundaries cannot drift away from the access control matrix.
+ * - `allowed`                   – an explicit grant exists in the matrix.
+ * - `role_not_registered`       – the role is not a key of the matrix.
+ * - `resource_not_registered`   – the resource is not registered for *any*
+ *                                 role (configuration drift/anomaly).
+ * - `resource_not_permitted`    – the resource is known but not granted to
+ *                                 this role (ordinary denial).
+ * - `action_not_recognized`     – the action is not a known platform action.
+ * - `action_not_permitted`      – the action is known but not granted to the
+ *                                 role for this resource (ordinary denial).
+ * - `invalid_input`             – the input was malformed (not a non-empty
+ *                                 string, or the matrix cell was corrupted).
  */
-const VALID_ROLE_SET: ReadonlySet<string> = new Set(VALID_ROLES);
-const VALID_RESOURCE_SET: ReadonlySet<string> = new Set(VALID_RESOURCES);
-const VALID_ACTION_SET: ReadonlySet<string> = new Set(VALID_ACTIONS);
+export type AuthorizationReason =
+  | 'allowed'
+  | 'role_not_registered'
+  | 'resource_not_registered'
+  | 'resource_not_permitted'
+  | 'action_not_recognized'
+  | 'action_not_permitted'
+  | 'invalid_input';
+
+/** Result of {@link evaluateAuthorization}. */
+export interface AuthorizationDecision {
+  /** `true` only when the exact triplet is explicitly granted. */
+  allowed: boolean;
+  /** Machine-readable explanation for {@link allowed}. */
+  reason: AuthorizationReason;
+}
 
 /**
- * Returns true only when the value is a non-empty string.
+ * All actions that appear anywhere in the access control matrix.
  *
- * This is the first validation boundary: runtime callers may pass null,
- * undefined, numbers, objects, or empty strings despite the TypeScript
- * types. The authorization function must not throw on such inputs.
+ * Derived from the matrix itself so it can never drift: adding a new action
+ * to `roles.ts` is automatically reflected here. Only own, enumerable
+ * properties are inspected.
  */
+const KNOWN_ACTIONS: ReadonlySet<string> = new Set(
+  Object.values(ACCESS_CONTROL_MATRIX).flatMap((permissions) =>
+    Object.values(permissions).flatMap((actions) =>
+      Array.isArray(actions) ? actions : [],
+    ),
+  ),
+);
+
+/**
+ * Every resource registered anywhere in the matrix.
+ *
+ * Used to tell a genuine configuration gap (a resource no role knows about)
+ * apart from an ordinary per-role denial, so only the former is logged.
+ */
+const KNOWN_RESOURCES: ReadonlySet<string> = new Set(
+  Object.values(ACCESS_CONTROL_MATRIX).flatMap((permissions) =>
+    permissions !== null && typeof permissions === 'object'
+      ? Object.keys(permissions)
+      : [],
+  ),
+);
+
+/** Anomalies worth surfacing in logs (as opposed to ordinary denials). */
+const ANOMALY_EVENT_BY_REASON: Readonly<Record<AuthorizationReason, string | null>> = {
+  allowed: null,
+  role_not_registered: 'authorization_deny_unresolved_role',
+  resource_not_registered: 'authorization_deny_unresolved_resource',
+  resource_not_permitted: null,
+  action_not_recognized: 'authorization_deny_unrecognized_action',
+  action_not_permitted: null,
+  invalid_input: 'authorization_deny_invalid_input',
+};
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+function hasOwn(obj: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 /**
- * Deep-freeze a value and recursively all of its own enumerable properties.
- *
- * This is used to make the access control matrix immutable at runtime.
- * Immutability is the key invariant that guarantees concurrent calls to
- * `isAllowed` observe a consistent snapshot of the matrix and therefore cannot
- * produce stale or inconsistent authorization results.
- *
- * Care is taken to tolerate non-object values and cycles safely:
- *   - Primitives and null/undefined are returned as-is.
- *   - Already-frozen objects are skipped to avoid redundant work and cycles.
+ * Reduce an arbitrary caller value to a safe, bounded descriptor for logs.
+ * Objects/arrays/functions are never expanded, so no caller payload can leak.
  */
-function deepFreeze<T>(value: T): T {
-  if (value === null || typeof value !== 'object') {
+function describe(value: unknown): string {
+  if (typeof value === 'string') {
     return value;
   }
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
 
-  if (Object.isFrozen(value)) {
-    return value;
+/**
+ * Pure, total evaluation of the (role, resource, action) triplet.
+ *
+ * This is the single source of truth for both {@link isAllowed} and
+ * {@link evaluateAuthorization}; neither can drift from the other.
+ */
+function decide(role: unknown, resource: unknown, action: unknown): AuthorizationDecision {
+  // 1. Shape validation. Non-string / empty inputs are denied, never thrown on.
+  if (!isNonEmptyString(role) || !isNonEmptyString(resource) || !isNonEmptyString(action)) {
+    return { allowed: false, reason: 'invalid_input' };
   }
 
-  Object.freeze(value);
-
-  for (const key of Object.getOwnPropertyNames(value)) {
-    const child = (value as Record<string, unknown>)[key];
-    if (child !== null && typeof child === 'object') {
-      deepFreeze(child);
-    }
+  // 2. Role must be an *own* key of the matrix. Inherited keys such as
+  //    `__proto__`, `constructor` or `toString` are not roles.
+  if (!hasOwn(ACCESS_CONTROL_MATRIX, role)) {
+    return { allowed: false, reason: 'role_not_registered' };
+  }
+  const permissions = (ACCESS_CONTROL_MATRIX as Record<string, unknown>)[role];
+  if (permissions === null || typeof permissions !== 'object') {
+    return { allowed: false, reason: 'invalid_input' };
   }
 
-  return value;
-}
+  // 3a. A resource that no role knows about is configuration drift → anomaly.
+  if (!KNOWN_RESOURCES.has(resource)) {
+    return { allowed: false, reason: 'resource_not_registered' };
+  }
 
-/**
- * The authorization matrix used at runtime.
- *
- * It is a deep-frozen view of `ACCESS_CONTROL_MATRIX` so that concurrent
- * callers cannot observe or cause mutations. The reference is captured once at
- * module load and never replaced.
- */
-const FROZEN_MATRIX = deepFreeze(ACCESS_CONTROL_MATRIX);
+  // 3b. A known resource that is simply not granted to this role is an
+  //     ordinary denial and is therefore not logged as an anomaly.
+  if (!hasOwn(permissions, resource)) {
+    return { allowed: false, reason: 'resource_not_permitted' };
+  }
+  const grantedActions = (permissions as Record<string, unknown>)[resource];
+  if (!Array.isArray(grantedActions)) {
+    return { allowed: false, reason: 'invalid_input' };
+  }
 
-/**
- * Structured logger contract used by this module.
- *
- * Implementations must not log raw user identity or credentials. The
- * authorization decision is deterministic and the logger is only used
- * for diagnosing unexpected failures.
- */
-export interface AuthorizationLogger {
-  warn(message: string, context?: Record<unknown, unknown>): void;
-  error(message: string, context?: Record<unknown, unknown>): void;
-}
+  // 4. Unknown actions are distinguished from known-but-denied ones so that
+  //    typo'd or injected actions surface in logs as anomalies.
+  if (!KNOWN_ACTIONS.has(action)) {
+    return { allowed: false, reason: 'action_not_recognized' };
+  }
 
-const noopLogger: AuthorizationLogger = {
-  warn() {
-    /* no-op by default; callers may inject a logger */
-  },
-  error() {
-    /* no-op by default; callers may inject a logger */
-  },
-};
-
-let activeLogger: AuthorizationLogger = noopLogger;
-
-/**
- * Replace the logger used for diagnostic events. Returns the previous
- * logger so callers (e.g. tests) can restore it deterministically.
- */
-export function setAuthorizationLogger(logger: AuthorizationLogger): AuthorizationLogger {
-  const previous = activeLogger;
-  activeLogger = logger ?? noopLogger;
-  return previous;
-}
-
-/**
- * Reset the logger to the default no-op implementation. Primarily used
- * by tests to avoid cross-test interference.
- */
-export function resetAuthorizationLogger(): void {
-  activeLogger = noopLogger;
+  // 5. Exact, explicit grant check.
+  const allowed = grantedActions.includes(action);
+  return { allowed, reason: allowed ? 'allowed' : 'action_not_permitted' };
 }
 
 /**
  * Check whether a role is permitted to perform an action on a resource.
  *
- * This function is pure with respect to the access control matrix and
- * its arguments. It is safe to call concurrently and idempotent under
- * retries. Any unexpected failure during evaluation fails closed (denied)
- * and is reported through the active logger.
+ * This is the public, backward-compatible API. It always returns a boolean
+ * and never throws (see the module-level contract above).
  *
  * @param role     - The user's role.
  * @param resource - The target resource.
@@ -205,6 +271,7 @@ export function isAllowed(role: Role, resource: Resource, action: Action): boole
     activeLogger.error('authorization.error.fail_closed', {
       message: error instanceof Error ? error.message : 'unknown error',
     });
-    return false;
   }
+
+  return decision;
 }

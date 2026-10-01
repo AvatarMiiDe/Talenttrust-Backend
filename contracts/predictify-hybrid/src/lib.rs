@@ -5,22 +5,13 @@
 //! ## Idempotency
 //!
 //! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-//! The key is stored in instance storage under
-//! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
-//! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
+//! The key is stored in temporary storage under
+//! `DataKey::PlaceBetsIdem(caller, key)` with an independent inclusive
+//! deadline of acceptance ledger + [`storage::IDEM_KEY_TTL_LEDGERS`] (~24 h). Repeated
 //! submissions with the same `(caller, key)` pair are rejected with
 //! `Error::IdempotentBatchAlreadyApplied`.
-//!
-//! ## Concurrency and failure models
-//!
-//! The idempotency sentinel is written **before** any bet is applied
-//! (write-ahead).  Because Soroban executes a contract invocation as
-//! a single atomic transaction, a failure during bet application rolls
-//! back the sentinel write as well -- there is no window in which a
-//! partial batch is observable.  Concurrent submissions with the same
-//! `(caller, key)` pair are serialized by the ledger and the second one
-//! is rejected deterministically with `Error::IdempotentBatchAlreadyApplied`.
-#!no_std
+
+#[no_std]
 
 #[cfg(test)]
 mod batch_operations_tests;
@@ -30,10 +21,12 @@ mod storage;
 
 #[cfg(test)]
 mod batch_operations_tests;
+#[cfg(test)]
+mod storage_tests;
 
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
 
 pub use bets::{BatchReceipt, Bet, MAX_BETS_PER_BATCH};
 pub use errors::Error;

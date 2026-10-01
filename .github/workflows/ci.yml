@@ -27,8 +27,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  contract-compatibility:
-    name: Contract Compatibility
+  # Contract storage regressions are Rust tests, outside the Node/Jest suite.
+  contracts:
+    name: Contract Invariants
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,11 +38,11 @@ jobs:
           components: rustfmt, clippy
       - name: Check contract formatting
         run: cargo fmt --manifest-path contracts/Cargo.toml -- --check
-      - name: Test storage compatibility
+      - name: Test contract invariants
         run: cargo test --locked --manifest-path contracts/Cargo.toml
-      - name: Check contract warnings
+      - name: Lint contract crate
         run: cargo clippy --locked --manifest-path contracts/Cargo.toml --all-targets -- -D warnings
-      - name: Build contract
+      - name: Build contract crate
         run: cargo build --locked --manifest-path contracts/Cargo.toml
 
   # ── 1. Lint ────────────────────────────────────────────────────────────────

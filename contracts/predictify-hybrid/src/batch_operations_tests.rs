@@ -25,10 +25,8 @@
 //! * A sentinel written by an older contract version (no recorded ledger) is
 //!   a durable replay guard, never an expiring one.
 
-#![cfg(test)]
-
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, EnvTestConfig, Ledger},
     Address, BytesN, Env, Vec,
 };
 
@@ -37,7 +35,13 @@ use crate::{bets::Bet, errors::Error, storage::{IDEM_KEY_TTL_LEDGERS, MAX_BATCH_
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn fresh_env() -> Env {
-    Env::default()
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.ledger().with_mut(|li| {
+        li.min_persistent_entry_ttl = IDEM_KEY_TTL_LEDGERS * 3;
+    });
+    env
 }
 
 fn register(env: &Env) -> (Address, PredictifyHybridClient<'_>) {
@@ -69,7 +73,7 @@ fn one_bet(env: &Env) -> Vec<Bet> {
 
 // ── batch_operations_tests module ─────────────────────────────────────────────
 
-mod batch_operations_tests {
+mod idempotency_tests {
     use super::*;
 
     // ── original idempotency tests (must not regress) ─────────────────────

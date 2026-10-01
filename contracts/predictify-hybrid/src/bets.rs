@@ -1,9 +1,6 @@
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
-use crate::{
-    errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE},
-};
+use crate::{errors::Error, storage::consume_idempotency_key};
 
 /// Maximum number of bets accepted in a single [`place_bets`] call.
 ///
@@ -88,54 +85,34 @@ fn validate_batch(bets: &Vec<Bet>) -> Result<(), Error> {
 ///
 /// * `env`             – Soroban host environment.
 /// * `caller`          – Address of the submitting account; `require_auth` is
-///                       called to authenticate the caller.
-/// * `bets`            – Non-empty, bounded vector of [`Bet`] entries.
+///   called to authenticate the caller.
+/// * `bets`            – Non-empty vector of [`Bet`] entries.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
-///   submission unique. The key is bound to `caller` so the same token may be
-///   used by different callers without conflict.
+///   submission unique. The key is bound to `caller` so the same token may
+///   be used by different callers without conflict.
 ///
 /// # Errors
 ///
-/// | Error                            | Condition                                    |
-/// |----------------------------------|----------------------------------------------|
-/// | [`Error::EmptyBatch`]            | `bets` is empty                              |
-/// | [`Error::BatchTooLarge`]         | `bets.len() > MAX_BATCH_SIZE`                |
-/// | [`Error::AmountMustBePositive`]  | any bet has `amount ≤ 0`                     |
-/// | [`Error::MarketIdInvalid`]       | any bet has `market_id == 0`                 |
-/// | [`Error::IdempotentBatchAlreadyApplied`] | `(caller, key)` pair already consumed |
-///
-/// # Validation order
-///
-/// Validation is intentionally ordered so the cheapest structural checks
-/// (`EmptyBatch`, `BatchTooLarge`) run before the per-element scan
-/// (`AmountMustBePositive`, `MarketIdInvalid`) and the storage read
-/// (`IdempotentBatchAlreadyApplied`).  No state is mutated until all
-/// validations pass, keeping the function atomic.
+/// * [`Error::EmptyBatch`]                  – `bets` is empty.
+/// * [`Error::BatchTooLarge`]               – `bets.len() > MAX_BETS_PER_BATCH`.
+/// * [`Error::InvalidMarketId`]             – a bet referenced `market_id == 0`.
+/// * [`Error::InvalidBetAmount`]            – a bet had `amount <= 0`.
+/// * [`Error::BatchAmountOverflow`]         – the batch total does not fit in an `i128`.
+/// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
+///   pair has already been consumed.
+/// * [`Error::IdempotencyRetentionUnavailable`] – the full retention window
+///   cannot be represented or supported.
 ///
 /// # Idempotency semantics
 ///
-/// The receipt is written to temporary storage **before** the batch is
-/// applied, and only after the batch has fully validated. If a previous
-/// call with the same key succeeded, the function returns
-/// [`Error::IdempotentBatchAlreadyApplied`] or
-/// [`Error::IdempotencyKeyReusedWithDifferentBatch`] without re-applying
-/// the batch. Once written, the receipt expires after
-/// [`IDEM_KEY_TTL_LEDGERS`] ledgers; after expiry the network has deleted
-/// it, a new submission with the same token is accepted as a fresh
-/// batch, and a client that lost the response of a successful call can
-/// safely retry inside the window or resubmit under a new token after it.
-/// See [`DataKey`] for why the receipt lives in temporary rather than
-/// instance or persistent storage.
-///
-/// Writing the receipt before applying is what makes the guarantee hold
-/// under concurrency: the receipt entry is declared read-write by every
-/// invocation, so a racing transaction that targets the same token cannot
-/// be included in the same ledger, and one that lands later sees the
-/// receipt. If this call instead fails, the host reverts the receipt
-/// together with everything else, so a rejected batch never burns a token.
-/// See *Concurrency model* in the module documentation for the exact
-/// guarantees and for what a client observes when it loses a same-ledger
-/// race.
+/// The key is reserved in temporary storage **before** processing the bets.
+/// If a previous call with the same key succeeded, the function returns
+/// [`Error::IdempotentBatchAlreadyApplied`] immediately without re-applying
+/// the batch. Each key has its own inclusive deadline at acceptance ledger +
+/// [`crate::storage::IDEM_KEY_TTL_LEDGERS`]; unrelated submissions and duplicate retries do
+/// not renew it. In the following ledger the token is accepted as a fresh
+/// batch. Reservation and effects commit or roll back together. Legacy
+/// instance sentinels follow the conservative cutoff documented in storage.
 ///
 /// A two-phase marker is used to make concurrent execution deterministic:
 /// the key is first written as *pending* (with a short TTL) and only promoted
@@ -200,43 +177,7 @@ pub fn place_bets(
     // A zero key opts out of deduplication (deprecated backward compat).
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
     if idempotency_key != zero_key {
-        let pending_key =
-            DataKey::PlaceBetsIdemPending(caller.clone(), idempotency_key.clone());
-        let applied_key =
-            DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
-
-        // Fast path: a previously completed batch with this key.
-        if env.storage().instance().has(&applied_key) {
-            return Err(Error::IdempotentBatchAlreadyApplied);
-        }
-
-        // Concurrent path: another invocation is mid-flight for this key.
-        // Fail fast instead of racing the first caller's state mutations.
-        if env.storage().instance().has(&pending_key) {
-            return Err(Error::BatchInProgress);
-        }
-
-        // Claim the key by writing a pending marker *before* applying the
-        // batch.  The short TTL bounds the window in which a trapped caller
-        // can leave the key unusable.
-        env.storage().instance().set(&pending_key, &true);
-        env.storage()
-            .instance()
-            .extend_ttl(PENDING_IDEM_KEY_TTL_LEDGERS, PENDING_IDEM_KEY_TTL_LEDGERS);
-
-        // Apply the batch.  Any error returned here leaves the pending
-        // marker in place; it will expire naturally, allowing a retry.
-        apply_batch(env, &caller, &bets)?;
-
-        // Promote the pending marker to an applied marker so subsequent
-        // calls with the same key are rejected as duplicates.
-        env.storage().instance().remove(&pending_key);
-        env.storage().instance().set(&applied_key, &true);
-        env.storage()
-            .instance()
-            .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
-
-        return Ok(());
+        consume_idempotency_key(env, &caller, &idempotency_key)?;
     }
     env.storage()
         .instance()
